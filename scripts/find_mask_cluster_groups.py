@@ -290,10 +290,20 @@ def filter_sam_masks_basic(
 # =========================================================
 # Group mask generation
 # =========================================================
-def union_mask_from_ids(sam_masks: List[dict], mask_ids: Tuple[int, ...]) -> np.ndarray:
+def union_mask_from_ids(
+    sam_masks: List[dict],
+    mask_ids: Tuple[int, ...],
+    close_kernel: int = 7,
+    close_iter: int = 1,
+) -> np.ndarray:
     seg = np.zeros_like(sam_masks[0]["segmentation"], dtype=np.uint8)
     for mid in mask_ids:
         seg = np.logical_or(seg > 0, sam_masks[mid]["segmentation"] > 0).astype(np.uint8) * 255
+
+    if len(mask_ids) > 1 and close_kernel > 1 and close_iter > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
+        seg = cv2.morphologyEx(seg, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
+
     return seg
 
 
@@ -564,7 +574,7 @@ def find_best_mask_groups_for_clusters_greedy(
         image_shape=image_shape,
         near_margin=20,
         min_bbox_iou=0.0,
-        max_centroid_dist=120.0,
+        max_centroid_dist=300.0,
         debug_progress=debug_progress,
         progress_steps=progress_steps,
     )
@@ -712,101 +722,6 @@ def score_mask_group_against_cluster(
 
     return score, iou, bi, contain, biou, ar, cent
 
-
-# =========================================================
-# Main search
-# =========================================================
-def find_best_mask_groups_for_clusters(
-    sam_masks: List[dict],
-    projected_clusters: List[LoadedClusterMask],
-    image_shape: Tuple[int, int],
-    max_group_size: int = 2,
-    max_candidates_per_cluster: int = 12,
-    min_score: float = 0.10,
-    min_iou: float = 0.03,
-    min_containment: float = 0.20,
-    improve_margin: float = 0.05,
-    debug_progress: bool = False,
-    progress_steps: int = 10,
-) -> List[MaskGroupMatch]:
-    mask_graph = build_mask_adjacency(
-        sam_masks=sam_masks,
-        image_shape=image_shape,
-        near_margin=20,
-        min_bbox_iou=0.0,
-        max_centroid_dist=120.0,
-        debug_progress=debug_progress,
-        progress_steps=progress_steps,
-    )
-
-    all_matches: List[MaskGroupMatch] = []
-
-    total_clusters = len(projected_clusters)
-    for idx, proj in enumerate(projected_clusters):
-        log_progress(
-            debug_progress,
-            "cluster_group_search_exhaustive",
-            idx,
-            total_clusters,
-            progress_steps,
-            extra=f"cluster_id={proj.cluster_id}",
-        )
-
-        groups = generate_group_candidates_for_cluster(
-            sam_masks=sam_masks,
-            cluster_proj=proj,
-            image_shape=image_shape,
-            mask_graph=mask_graph,
-            max_group_size=max_group_size,
-            max_candidates=max_candidates_per_cluster,
-        )
-
-        best_single: Optional[MaskGroupMatch] = None
-        best_group: Optional[MaskGroupMatch] = None
-
-        for g in groups:
-            group_mask = union_mask_from_ids(sam_masks, g)
-            scored = score_mask_group_against_cluster(group_mask, proj)
-            if scored is None:
-                continue
-
-            score, iou, bi, contain, biou, ar, cent = scored
-
-            if score < min_score:
-                continue
-            if iou < min_iou and contain < min_containment:
-                continue
-
-            match = MaskGroupMatch(
-                cluster_id=proj.cluster_id,
-                mask_ids=g,
-                score=score,
-                iou=iou,
-                boundary_iou=bi,
-                containment=contain,
-                bbox_iou=biou,
-                area_ratio=ar,
-                centroid_score=cent,
-            )
-
-            if len(g) == 1:
-                if best_single is None or match.score > best_single.score:
-                    best_single = match
-
-            if best_group is None or match.score > best_group.score:
-                best_group = match
-
-        if best_group is None:
-            continue
-
-        if len(best_group.mask_ids) > 1 and best_single is not None:
-            if best_group.score < best_single.score + improve_margin:
-                best_group = best_single
-
-        all_matches.append(best_group)
-
-    all_matches.sort(key=lambda x: x.score, reverse=True)
-    return all_matches
 
 
 # =========================================================
@@ -956,13 +871,13 @@ def main() -> None:
     parser.add_argument("--cluster-boundary-dir", type=str, required=False, default="", help="Optional path to cluster boundary mask dir")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to save results")
 
-    parser.add_argument("--greedy-min-improve", type=float, default=0.01)
+    parser.add_argument("--greedy-min-improve", type=float, default=0.001)
     parser.add_argument("--max-group-size", type=int, default=0,
                         help="0 means unlimited greedy growth")
     parser.add_argument("--min-score", type=float, default=0.10)
     parser.add_argument("--min-iou", type=float, default=0.01)
     parser.add_argument("--min-containment", type=float, default=0.10)
-    parser.add_argument("--improve-margin", type=float, default=0.1)
+    parser.add_argument("--improve-margin", type=float, default=0.0)
     parser.add_argument("--min-mask-area", type=int, default=200)
     parser.add_argument("--max-mask-area-ratio", type=float, default=0.35)
     parser.add_argument("--top-k", type=int, default=15)
