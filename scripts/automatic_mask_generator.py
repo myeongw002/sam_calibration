@@ -489,6 +489,12 @@ def save_raw_outputs(output_dir: Path, image_rgb: np.ndarray, raw_masks: list[di
     with (raw_dir / "raw_masks_metadata.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
+    mask_dir = raw_dir / "raw_mask_pngs"
+    mask_dir.mkdir(exist_ok=True)
+    for idx, ann in enumerate(raw_masks):
+        seg = (ann["segmentation"].astype(np.uint8) * 255)
+        cv2.imwrite(str(mask_dir / f"raw_mask_{idx:04d}.png"), seg)
+
     overlay_rgb = generate_overlay(image_rgb, raw_masks, seed)
     cv2.imwrite(str(raw_dir / "raw_overlay.png"), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
 

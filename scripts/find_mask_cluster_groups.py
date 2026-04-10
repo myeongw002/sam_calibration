@@ -39,6 +39,19 @@ class MaskGroupMatch:
     centroid_score: float
 
 
+def update_score_log(
+    score_log_map: Optional[Dict[Tuple[int, Tuple[int, ...]], MaskGroupMatch]],
+    match: MaskGroupMatch,
+) -> None:
+    if score_log_map is None:
+        return
+
+    key = (match.cluster_id, match.mask_ids)
+    prev = score_log_map.get(key)
+    if prev is None or match.score > prev.score:
+        score_log_map[key] = match
+
+
 def log_progress(
     enabled: bool,
     stage: str,
@@ -186,6 +199,32 @@ def compute_bbox_fill_ratio(mask: np.ndarray, bbox: Optional[Tuple[int, int, int
     bbox_area_val = max(1, x2 - x1 + 1) * max(1, y2 - y1 + 1)
     return float(area) / float(bbox_area_val)
 
+def mask_precision(cluster_mask: np.ndarray, image_mask: np.ndarray) -> float:
+    c = cluster_mask > 0
+    m = image_mask > 0
+    inter = np.logical_and(c, m).sum()
+    denom = m.sum()
+    if denom == 0:
+        return 0.0
+    return float(inter) / float(denom)
+
+
+def connected_component_score(mask: np.ndarray) -> float:
+    binary = (mask > 0).astype(np.uint8)
+    num_labels, _ = cv2.connectedComponents(binary, connectivity=8)
+    ncc = max(0, num_labels - 1)  # background 제외
+    if ncc <= 1:
+        return 1.0
+    return 1.0 / float(ncc)
+
+
+def oversize_penalty(group_mask: np.ndarray, cluster_mask: np.ndarray) -> float:
+    ga = int((group_mask > 0).sum())
+    ca = int((cluster_mask > 0).sum())
+    if ca == 0:
+        return 1.0
+    # cluster보다 커진 만큼만 penalty
+    return max(0.0, float(ga) / float(ca) - 1.0)
 
 # =========================================================
 # Loaders
@@ -208,6 +247,7 @@ def load_sam_masks(npz_path: str, metadata_path: Optional[str] = None) -> List[d
     for i in range(stack.shape[0]):
         ann = dict(metadata[i]) if i < len(metadata) else {}
         ann["segmentation"] = stack[i].astype(bool)
+        ann["raw_id"] = i
         masks.append(ann)
 
     return masks
@@ -357,32 +397,56 @@ def build_mask_adjacency(
 
     return graph
 
+def dilate_mask(mask: np.ndarray, kernel_size: int = 5, iterations: int = 1) -> np.ndarray:
+    mask_u8 = (mask > 0).astype(np.uint8) * 255
+    if kernel_size <= 1 or iterations <= 0:
+        return mask_u8
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(mask_u8, kernel, iterations=iterations)
+
+
 def candidate_mask_ids_for_cluster_overlap_all(
     sam_masks: List[dict],
     cluster_proj: LoadedClusterMask,
     image_shape: Tuple[int, int],
-    bbox_margin: int = 30,
+    cluster_dilate_kernel: int = 5,
+    cluster_dilate_iter: int = 1,
+    min_overlap_pixels: int = 20,
+    min_overlap_ratio: float = 0.01,
 ) -> List[int]:
     """
-    Use all masks whose bbox overlaps the expanded cluster bbox.
-    No top-K truncation here.
+    Use all masks that overlap the cluster binary mask itself
+    (optionally slightly dilated for tolerance), not the cluster bbox.
     """
-    cluster_bbox = cluster_proj.bbox_xyxy
-    if cluster_bbox is None:
+    cluster_mask = (cluster_proj.binary_mask > 0).astype(np.uint8) * 255
+    if cluster_mask.sum() == 0:
         return []
 
-    cluster_bbox_exp = expand_bbox(cluster_bbox, bbox_margin, image_shape)
+    # 약간 dilation해서 경계 오차 허용
+    cluster_mask_dil = dilate_mask(
+        cluster_mask,
+        kernel_size=cluster_dilate_kernel,
+        iterations=cluster_dilate_iter,
+    ) > 0
 
     candidates = []
+
     for mid, ann in enumerate(sam_masks):
-        m = (ann["segmentation"] > 0).astype(np.uint8) * 255
-        b = mask_bbox(m)
-        if b is None:
+        m = (ann["segmentation"] > 0)
+
+        inter = np.logical_and(cluster_mask_dil, m).sum()
+        if inter < min_overlap_pixels:
             continue
 
-        # any overlap
-        if bbox_iou(cluster_bbox_exp, b) > 0.0:
-            candidates.append(mid)
+        mask_area_val = m.sum()
+        if mask_area_val == 0:
+            continue
+
+        overlap_ratio = float(inter) / float(mask_area_val)
+        if overlap_ratio < min_overlap_ratio:
+            continue
+
+        candidates.append(mid)
 
     return candidates
 
@@ -390,6 +454,7 @@ def score_single_masks_for_cluster(
     sam_masks: List[dict],
     cluster_proj: LoadedClusterMask,
     candidate_ids: List[int],
+    score_log_map: Optional[Dict[Tuple[int, Tuple[int, ...]], MaskGroupMatch]] = None,
 ) -> List[MaskGroupMatch]:
     singles: List[MaskGroupMatch] = []
 
@@ -414,6 +479,7 @@ def score_single_masks_for_cluster(
                 centroid_score=cent,
             )
         )
+        update_score_log(score_log_map, singles[-1])
 
     singles.sort(key=lambda x: x.score, reverse=True)
     return singles
@@ -426,6 +492,7 @@ def greedy_expand_group_for_cluster(
     mask_graph: Dict[int, List[int]],
     min_improve: float = 0.01,
     max_group_size: Optional[int] = None,
+    score_log_map: Optional[Dict[Tuple[int, Tuple[int, ...]], MaskGroupMatch]] = None,
 ) -> MaskGroupMatch:
     """
     Start from one single-mask seed and greedily add one adjacent mask at a time
@@ -475,6 +542,7 @@ def greedy_expand_group_for_cluster(
                     area_ratio=ar,
                     centroid_score=cent,
                 )
+                update_score_log(score_log_map, best_next_match)
 
         if best_next_match is None:
             break
@@ -498,6 +566,7 @@ def find_best_mask_group_for_one_cluster_greedy(
     improve_margin: float = 0.05,
     greedy_min_improve: float = 0.01,
     max_group_size: Optional[int] = None,
+    score_log_map: Optional[Dict[Tuple[int, Tuple[int, ...]], MaskGroupMatch]] = None,
 ) -> Optional[MaskGroupMatch]:
     """
     For one cluster:
@@ -510,7 +579,10 @@ def find_best_mask_group_for_one_cluster_greedy(
         sam_masks=sam_masks,
         cluster_proj=cluster_proj,
         image_shape=image_shape,
-        bbox_margin=30,
+        cluster_dilate_kernel=5,
+        cluster_dilate_iter=1,
+        min_overlap_pixels=20,
+        min_overlap_ratio=0.01,
     )
 
     if len(candidate_ids) == 0:
@@ -520,6 +592,7 @@ def find_best_mask_group_for_one_cluster_greedy(
         sam_masks=sam_masks,
         cluster_proj=cluster_proj,
         candidate_ids=candidate_ids,
+        score_log_map=score_log_map,
     )
 
     if len(single_matches) == 0:
@@ -538,6 +611,7 @@ def find_best_mask_group_for_one_cluster_greedy(
             mask_graph=mask_graph,
             min_improve=greedy_min_improve,
             max_group_size=max_group_size,   # None이면 score가 오를 때까지 계속
+            score_log_map=score_log_map,
         )
 
         if grown.score > best_group.score:
@@ -568,13 +642,14 @@ def find_best_mask_groups_for_clusters_greedy(
     max_group_size: Optional[int] = None,
     debug_progress: bool = False,
     progress_steps: int = 10,
+    score_log_map: Optional[Dict[Tuple[int, Tuple[int, ...]], MaskGroupMatch]] = None,
 ) -> List[MaskGroupMatch]:
     mask_graph = build_mask_adjacency(
         sam_masks=sam_masks,
         image_shape=image_shape,
         near_margin=20,
         min_bbox_iou=0.0,
-        max_centroid_dist=300.0,
+        max_centroid_dist=150.0,
         debug_progress=debug_progress,
         progress_steps=progress_steps,
     )
@@ -603,12 +678,98 @@ def find_best_mask_groups_for_clusters_greedy(
             improve_margin=improve_margin,
             greedy_min_improve=greedy_min_improve,
             max_group_size=max_group_size,
+            score_log_map=score_log_map,
         )
         if best is not None:
             matches.append(best)
 
     matches.sort(key=lambda x: x.score, reverse=True)
     return matches
+
+
+def sort_score_log_by_cluster(
+    score_log_map: Dict[Tuple[int, Tuple[int, ...]], MaskGroupMatch],
+) -> Dict[int, List[MaskGroupMatch]]:
+    by_cluster: Dict[int, List[MaskGroupMatch]] = {}
+    for match in score_log_map.values():
+        by_cluster.setdefault(match.cluster_id, []).append(match)
+
+    for cid in by_cluster:
+        by_cluster[cid].sort(key=lambda x: x.score, reverse=True)
+
+    return by_cluster
+
+
+def mask_ids_to_raw_ids(sam_masks: List[dict], mask_ids: Tuple[int, ...]) -> Tuple[int, ...]:
+    raw_ids: List[int] = []
+    for mid in mask_ids:
+        if 0 <= mid < len(sam_masks):
+            raw_ids.append(int(sam_masks[mid].get("raw_id", mid)))
+        else:
+            raw_ids.append(int(mid))
+    return tuple(raw_ids)
+
+
+def print_combination_scores(
+    score_log_map: Dict[Tuple[int, Tuple[int, ...]], MaskGroupMatch],
+    sam_masks: List[dict],
+    top_k_per_cluster: int,
+) -> None:
+    by_cluster = sort_score_log_by_cluster(score_log_map)
+    if not by_cluster:
+        print("[INFO] no combination scores collected")
+        return
+
+    print("=" * 130)
+    print("[INFO] combination score table (cluster-wise)")
+    print("=" * 130)
+
+    for cid in sorted(by_cluster.keys()):
+        print(f"[INFO] cluster {cid} top {top_k_per_cluster}")
+        print(f"{'rank':<6} {'raw_ids':<24} {'score':<10} {'IoU':<10} {'B-IoU':<10} {'Contain':<10} {'BBoxIoU':<10} {'AreaRatio':<10}")
+        print("-" * 130)
+        for rank, m in enumerate(by_cluster[cid][:top_k_per_cluster]):
+            raw_ids = mask_ids_to_raw_ids(sam_masks, m.mask_ids)
+            print(
+                f"{rank:<6} {str(list(raw_ids)):<24} "
+                f"{m.score:<10.4f} {m.iou:<10.4f} {m.boundary_iou:<10.4f} "
+                f"{m.containment:<10.4f} {m.bbox_iou:<10.4f} {m.area_ratio:<10.4f}"
+            )
+        print("=" * 130)
+
+
+def save_combination_scores(
+    score_log_map: Dict[Tuple[int, Tuple[int, ...]], MaskGroupMatch],
+    sam_masks: List[dict],
+    output_dir: str,
+    top_k_per_cluster: int,
+) -> str:
+    by_cluster = sort_score_log_by_cluster(score_log_map)
+    path = os.path.join(output_dir, "combination_scores.txt")
+
+    with open(path, "w", encoding="utf-8") as f:
+        if not by_cluster:
+            f.write("[INFO] no combination scores collected\n")
+            return path
+
+        f.write("=" * 130 + "\n")
+        f.write("[INFO] combination score table (cluster-wise)\n")
+        f.write("=" * 130 + "\n")
+
+        for cid in sorted(by_cluster.keys()):
+            f.write(f"[INFO] cluster {cid} top {top_k_per_cluster}\n")
+            f.write(f"{'rank':<6} {'raw_ids':<24} {'score':<10} {'IoU':<10} {'B-IoU':<10} {'Contain':<10} {'BBoxIoU':<10} {'AreaRatio':<10}\n")
+            f.write("-" * 130 + "\n")
+            for rank, m in enumerate(by_cluster[cid][:top_k_per_cluster]):
+                raw_ids = mask_ids_to_raw_ids(sam_masks, m.mask_ids)
+                f.write(
+                    f"{rank:<6} {str(list(raw_ids)):<24} "
+                    f"{m.score:<10.4f} {m.iou:<10.4f} {m.boundary_iou:<10.4f} "
+                    f"{m.containment:<10.4f} {m.bbox_iou:<10.4f} {m.area_ratio:<10.4f}\n"
+                )
+            f.write("=" * 130 + "\n")
+
+    return path
 
 
 def candidate_mask_ids_for_cluster(
@@ -690,12 +851,6 @@ def generate_group_candidates_for_cluster(
 def score_mask_group_against_cluster(
     group_mask: np.ndarray,
     cluster_proj: LoadedClusterMask,
-    iou_weight: float = 0.45,
-    boundary_weight: float = 0.25,
-    containment_weight: float = 0.20,
-    bbox_weight: float = 0.06,
-    area_weight: float = 0.03,
-    centroid_weight: float = 0.01,
 ) -> Optional[Tuple[float, float, float, float, float, float, float]]:
     cluster_mask = cluster_proj.binary_mask
     bbox1 = mask_bbox(group_mask)
@@ -704,20 +859,32 @@ def score_mask_group_against_cluster(
     if bbox1 is None or bbox2 is None:
         return None
 
+    # 기존 로그용 metric
     iou = mask_iou(group_mask, cluster_mask)
-    contain = mask_containment(cluster_mask, group_mask)
+    contain = mask_containment(cluster_mask, group_mask)   # recall 성격
     bi = boundary_iou(group_mask, cluster_mask, band_width=3)
     biou = bbox_iou(bbox1, bbox2)
     ar = area_ratio(group_mask, cluster_mask)
     cent = centroid_score(group_mask, cluster_mask, sigma=120.0)
 
+    # 새 metric
+    prec = mask_precision(cluster_mask, group_mask)
+    conn = connected_component_score(group_mask)
+    over = oversize_penalty(group_mask, cluster_mask)
+
+    # 새 score:
+    # - contain(coverage) 비중을 크게
+    # - IoU는 보조
+    # - precision / connectedness 추가
+    # - 너무 커지면 penalty
     score = (
-        iou_weight * iou
-        + boundary_weight * bi
-        + containment_weight * contain
-        + bbox_weight * biou
-        + area_weight * ar
-        + centroid_weight * cent
+        0.20 * iou +
+        0.05 * bi +
+        0.40 * contain +
+        0.15 * biou +
+        0.10 * prec +
+        0.10 * conn
+        - 0.10 * over
     )
 
     return score, iou, bi, contain, biou, ar, cent
@@ -765,7 +932,8 @@ def overlay_mask_group_matches(
         if proj.bbox_xyxy is not None:
             x1, y1, x2, y2 = proj.bbox_xyxy
             cv2.rectangle(vis, (x1, y1), (x2, y2), tuple(int(c) for c in color), 1)
-            txt = f"r{rank} c{match.cluster_id} m{list(match.mask_ids)} s={match.score:.2f}"
+            raw_ids = mask_ids_to_raw_ids(sam_masks, match.mask_ids)
+            txt = f"r{rank} c{match.cluster_id} m{list(raw_ids)} s={match.score:.2f}"
             cv2.putText(
                 vis,
                 txt,
@@ -780,13 +948,18 @@ def overlay_mask_group_matches(
     return np.clip(vis, 0, 255).astype(np.uint8)
 
 
-def print_group_matches(matches: List[MaskGroupMatch], top_k: int = 15) -> None:
+def print_group_matches(
+    matches: List[MaskGroupMatch],
+    sam_masks: List[dict],
+    top_k: int = 15,
+) -> None:
     print("=" * 130)
-    print(f"{'rank':<6} {'cluster':<8} {'mask_ids':<20} {'score':<10} {'IoU':<10} {'B-IoU':<10} {'Contain':<10} {'BBoxIoU':<10} {'AreaRatio':<10}")
+    print(f"{'rank':<6} {'cluster':<8} {'raw_ids':<20} {'score':<10} {'IoU':<10} {'B-IoU':<10} {'Contain':<10} {'BBoxIoU':<10} {'AreaRatio':<10}")
     print("-" * 130)
     for rank, m in enumerate(matches[:top_k]):
+        raw_ids = mask_ids_to_raw_ids(sam_masks, m.mask_ids)
         print(
-            f"{rank:<6} {m.cluster_id:<8} {str(list(m.mask_ids)):<20} "
+            f"{rank:<6} {m.cluster_id:<8} {str(list(raw_ids)):<20} "
             f"{m.score:<10.4f} {m.iou:<10.4f} {m.boundary_iou:<10.4f} "
             f"{m.containment:<10.4f} {m.bbox_iou:<10.4f} {m.area_ratio:<10.4f}"
         )
@@ -877,12 +1050,15 @@ def main() -> None:
     parser.add_argument("--min-score", type=float, default=0.10)
     parser.add_argument("--min-iou", type=float, default=0.01)
     parser.add_argument("--min-containment", type=float, default=0.10)
-    parser.add_argument("--improve-margin", type=float, default=0.0)
+    parser.add_argument("--improve-margin", type=float, default=0.01)
     parser.add_argument("--min-mask-area", type=int, default=200)
     parser.add_argument("--max-mask-area-ratio", type=float, default=0.35)
     parser.add_argument("--top-k", type=int, default=15)
     parser.add_argument("--debug-progress", action="store_true", help="Print stage progress logs")
     parser.add_argument("--progress-steps", type=int, default=10, help="Approximate number of progress prints per stage")
+    parser.add_argument("--print-combination-scores", action="store_true", help="Print scored mask combinations by cluster")
+    parser.add_argument("--save-combination-scores", action="store_true", help="Save scored mask combinations to text file")
+    parser.add_argument("--combination-top-k", type=int, default=50, help="Top-K combinations per cluster for print/save")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -925,6 +1101,10 @@ def main() -> None:
     )
     print(f"[INFO] loaded cluster masks: {len(projected_clusters)}")
     max_group_size = None if args.max_group_size == 0 else args.max_group_size
+    score_log_map: Optional[Dict[Tuple[int, Tuple[int, ...]], MaskGroupMatch]] = None
+    if args.print_combination_scores or args.save_combination_scores:
+        score_log_map = {}
+
     # Find best mask groups
     matches = find_best_mask_groups_for_clusters_greedy(
         sam_masks=sam_masks,
@@ -938,6 +1118,7 @@ def main() -> None:
         max_group_size=max_group_size,
         debug_progress=args.debug_progress,
         progress_steps=args.progress_steps,
+        score_log_map=score_log_map,
     )
 
     print(f"[INFO] best matches before size filtering: {len(matches)}")
@@ -953,17 +1134,34 @@ def main() -> None:
     )
 
     print(f"[INFO] matches after size filtering: {len(matches)}")
-    print_group_matches(matches, top_k=args.top_k)
+    print_group_matches(matches, sam_masks=sam_masks, top_k=args.top_k)
+
+    if args.print_combination_scores and score_log_map is not None:
+        print_combination_scores(
+            score_log_map,
+            sam_masks=sam_masks,
+            top_k_per_cluster=args.combination_top_k,
+        )
+
+    if args.save_combination_scores and score_log_map is not None:
+        comb_score_path = save_combination_scores(
+            score_log_map=score_log_map,
+            sam_masks=sam_masks,
+            output_dir=args.output_dir,
+            top_k_per_cluster=args.combination_top_k,
+        )
+        print(f"[INFO] saved combination scores: {comb_score_path}")
 
     # Save text results
     txt_path = os.path.join(args.output_dir, "group_matches.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write("=" * 130 + "\n")
-        f.write(f"{'rank':<6} {'cluster':<8} {'mask_ids':<20} {'score':<10} {'IoU':<10} {'B-IoU':<10} {'Contain':<10} {'BBoxIoU':<10} {'AreaRatio':<10}\n")
+        f.write(f"{'rank':<6} {'cluster':<8} {'raw_ids':<20} {'score':<10} {'IoU':<10} {'B-IoU':<10} {'Contain':<10} {'BBoxIoU':<10} {'AreaRatio':<10}\n")
         f.write("-" * 130 + "\n")
         for rank, m in enumerate(matches[:args.top_k]):
+            raw_ids = mask_ids_to_raw_ids(sam_masks, m.mask_ids)
             f.write(
-                f"{rank:<6} {m.cluster_id:<8} {str(list(m.mask_ids)):<20} "
+                f"{rank:<6} {m.cluster_id:<8} {str(list(raw_ids)):<20} "
                 f"{m.score:<10.4f} {m.iou:<10.4f} {m.boundary_iou:<10.4f} "
                 f"{m.containment:<10.4f} {m.bbox_iou:<10.4f} {m.area_ratio:<10.4f}\n"
             )
